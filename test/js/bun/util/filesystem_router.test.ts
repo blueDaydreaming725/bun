@@ -1,8 +1,21 @@
 import { FileSystemRouter } from "bun";
 import { heapStats } from "bun:jsc";
-import { expect, it } from "bun:test";
+import { describe, expect, it } from "bun:test";
 import fs, { mkdirSync, rmSync } from "fs";
-import { bunEnv, bunExe, isASAN, isMacOS, isWindows, normalizeBunSnapshot, tempDir, tmpdirSync } from "harness";
+import {
+  bunEnv,
+  bunExe,
+  expectRssDeltaBelow,
+  isASAN,
+  isDebug,
+  isLinux,
+  isMacOS,
+  isWindows,
+  normalizeBunSnapshot,
+  tempDir,
+  tmpdirSync,
+  unprivilegedSpawnOptions,
+} from "harness";
 import path, { dirname } from "path";
 
 function createTree(basedir: string, paths: string[]) {
@@ -499,7 +512,6 @@ it("the constructor and reload() don't create allocator heaps", () => {
 
   for (const fileExtensions of [undefined, [".tsx", ".ts"]]) {
     const create = () => new FileSystemRouter({ dir, style: "nextjs", fileExtensions });
-    // The first router warms the resolver's directory cache.
     const router = create();
     router.reload();
 
@@ -1019,10 +1031,13 @@ it("match() returns null when the path string does not start with '/'", () => {
 });
 
 it("reload() while Bun.build() resolves the same directory", async () => {
-  // The router's route-load loop and Bun.build's entry-point resolution (which
-  // runs on the bundler thread) share the process-global directory-entry cache.
+  // Bun.build's entry-point resolution runs on the bundler thread and rewrites
+  // the process-global directory-entry cache in place. A route scan on the main
+  // thread must not read that cache.
   // Run in a subprocess so a crash is observable as a signal instead of taking
   // down the test runner.
+  // On a debug build the builds of 40 rounds alone take longer than the test may run.
+  const rounds = isDebug ? 10 : 40;
   const files: Record<string, string> = {
     "fixture.ts": /* ts */ `
       import path from "path";
@@ -1039,12 +1054,12 @@ it("reload() while Bun.build() resolves the same directory", async () => {
       });
       // The first build completes with generation 0 and the bundle thread then
       // bumps its generation, so every later build's resolver re-reads the
-      // directory listing in place. reload() iterates the same listing on the
-      // main thread, and that in-place re-read is what the reload loop races.
+      // directory listing in place, while reload() lists the same directory on
+      // the main thread.
       await Bun.build({ entrypoints, target: "bun", throw: false });
       let matches = 0;
       let buildsOk = true;
-      for (let round = 0; round < 40; round++) {
+      for (let round = 0; round < ${rounds}; round++) {
         const builds = Array.from({ length: 4 }, () =>
           Bun.build({ entrypoints, target: "bun", throw: false }),
         );
@@ -1078,13 +1093,13 @@ it("reload() while Bun.build() resolves the same directory", async () => {
     stderr: normalizeBunSnapshot(stderr, String(dir)),
     exitCode,
     signalCode: proc.signalCode,
-  }).toEqual({ stdout: "matches 2000 builds-ok true", stderr: "", exitCode: 0, signalCode: null });
+  }).toEqual({ stdout: `matches ${rounds * 50} builds-ok true`, stderr: "", exitCode: 0, signalCode: null });
 }, 60_000);
 
 it("loads routes from a directory already cached by Bun.build()", async () => {
-  // The resolver caches the directory name without a trailing slash while the
-  // router spells it with one; loading routes out of the already-populated
-  // entry cache must accept either spelling. Run in a subprocess so a crash is
+  // The resolver has the directory cached, and under a name without a trailing
+  // slash while the router spells it with one. The router names its routes from
+  // its own walk of the directory. Run in a subprocess so a crash is
   // observable as a nonzero exit instead of taking down the test runner.
   using dir = tempDir("fsr-prewarmed-entry-cache", {
     "fixture.ts": /* ts */ `
@@ -1311,4 +1326,607 @@ it(".query and .params support names that look like array indices", () => {
   const params = router.match("/hello")!.params;
   expect(params).toEqual({ 0: "hello" });
   expect(params[0]).toBe("hello");
+});
+
+const page = "export default 1;\n";
+const routeNames = (router: FileSystemRouter) => Object.keys(router.routes).sort();
+const routerOver = (dir: string, options: { fileExtensions?: string[] } = {}) =>
+  new FileSystemRouter({ style: "nextjs", dir, ...options });
+/** `routes` with each file path relative to `root`, in POSIX form. */
+const routesBelow = (router: FileSystemRouter, root: string) =>
+  Object.fromEntries(
+    Object.entries(router.routes)
+      .sort(([a], [b]) => (a < b ? -1 : 1))
+      .map(([name, filePath]) => [name, path.relative(root, filePath).replaceAll("\\", "/")]),
+  );
+
+describe("a new router reads the directory from disk", () => {
+  // Each of these leaves a record of `pages` in the resolver's directory cache.
+  const recorders: Record<string, (pages: string) => unknown> = {
+    "an earlier router": pages => routerOver(pages),
+    "import()": pages => import(path.join(pages, "a.tsx")),
+    "require()": pages => require(path.join(pages, "a.tsx")),
+    "Bun.resolveSync()": pages => Bun.resolveSync("./a.tsx", pages),
+    "Bun.build()": pages => Bun.build({ entrypoints: [path.join(pages, "a.tsx")], target: "bun", throw: false }),
+  };
+  it.each(Object.keys(recorders))("after %s read it", async recorder => {
+    using dir = tempDir("fsr-fresh-recorded", { "pages/a.tsx": page, "pages/old.tsx": page });
+    const pages = path.join(String(dir), "pages");
+    await recorders[recorder](pages);
+
+    fs.writeFileSync(path.join(pages, "new.tsx"), page);
+    fs.rmSync(path.join(pages, "old.tsx"));
+    expect(routesBelow(routerOver(pages), pages)).toEqual({ "/a": "a.tsx", "/new": "new.tsx" });
+  });
+
+  it("a file added to and a file removed from a subdirectory", () => {
+    using dir = tempDir("fsr-fresh-subdir", { "pages/a.tsx": page, "pages/sub/old.tsx": page });
+    const pages = path.join(String(dir), "pages");
+    expect(routeNames(routerOver(pages))).toEqual(["/a", "/sub/old"]);
+
+    fs.writeFileSync(path.join(pages, "sub", "new.tsx"), page);
+    fs.rmSync(path.join(pages, "sub", "old.tsx"));
+    expect(routeNames(routerOver(pages))).toEqual(["/a", "/sub/new"]);
+    // A router over the subdirectory reads it too.
+    expect(routeNames(routerOver(path.join(pages, "sub")))).toEqual(["/new"]);
+  });
+
+  it("a new and a removed subdirectory", () => {
+    using dir = tempDir("fsr-fresh-dirs", { "pages/a.tsx": page, "pages/gone/post.tsx": page });
+    const pages = path.join(String(dir), "pages");
+    expect(routeNames(routerOver(pages))).toEqual(["/a", "/gone/post"]);
+
+    fs.mkdirSync(path.join(pages, "blog"));
+    fs.writeFileSync(path.join(pages, "blog", "post.tsx"), page);
+    fs.rmSync(path.join(pages, "gone"), { recursive: true });
+    expect(routeNames(routerOver(pages))).toEqual(["/a", "/blog/post"]);
+  });
+
+  it("a file replaced by a directory of the same name", () => {
+    using dir = tempDir("fsr-fresh-swap", { "pages/a.tsx": page, "pages/b.tsx": page });
+    const pages = path.join(String(dir), "pages");
+    expect(routeNames(routerOver(pages))).toEqual(["/a", "/b"]);
+
+    fs.rmSync(path.join(pages, "b.tsx"));
+    fs.mkdirSync(path.join(pages, "b.tsx"));
+    fs.writeFileSync(path.join(pages, "b.tsx", "c.tsx"), page);
+    expect(routeNames(routerOver(pages))).toEqual(["/a", "/b.tsx/c"]);
+  });
+
+  it("a directory created after the constructor threw for it", () => {
+    using dir = tempDir("fsr-fresh-missing", {});
+    const pages = path.join(String(dir), "pages");
+    expect(() => routerOver(pages)).toThrow(`Unable to find directory: ${pages}`);
+
+    fs.mkdirSync(pages);
+    fs.writeFileSync(path.join(pages, "a.tsx"), page);
+    expect(routeNames(routerOver(pages))).toEqual(["/a"]);
+  });
+
+  it("a directory removed after a router read it", () => {
+    using dir = tempDir("fsr-fresh-removed", { "pages/a.tsx": page });
+    const pages = path.join(String(dir), "pages");
+    expect(routeNames(routerOver(pages))).toEqual(["/a"]);
+
+    fs.rmSync(pages, { recursive: true });
+    expect(() => routerOver(pages)).toThrow(
+      expect.objectContaining({ name: "Error", message: `Unable to find directory: ${pages}` }),
+    );
+  });
+
+  it("in a Worker, after a router on the main thread", async () => {
+    using dir = tempDir("fsr-fresh-worker", {
+      "pages/a.tsx": page,
+      "pages/old.tsx": page,
+      "worker.mjs": `
+        self.onmessage = event => {
+          const router = new Bun.FileSystemRouter({ style: "nextjs", dir: event.data });
+          postMessage(Object.keys(router.routes).sort());
+        };
+      `,
+    });
+    const pages = path.join(String(dir), "pages");
+    expect(routeNames(routerOver(pages))).toEqual(["/a", "/old"]);
+    fs.writeFileSync(path.join(pages, "new.tsx"), page);
+    fs.rmSync(path.join(pages, "old.tsx"));
+
+    const worker = new Worker(path.join(String(dir), "worker.mjs"));
+    try {
+      const { promise, resolve, reject } = Promise.withResolvers<string[]>();
+      worker.onmessage = event => resolve(event.data);
+      worker.onerror = reject;
+      worker.postMessage(pages);
+      expect(await promise).toEqual(["/a", "/new"]);
+    } finally {
+      worker.terminate();
+    }
+  });
+});
+
+it("routes and match() keep the scan they came from until reload()", () => {
+  using dir = tempDir("fsr-scan-snapshot", { "pages/a.tsx": page, "pages/old.tsx": page, "pages/[id]/post.tsx": page });
+  const pages = path.join(String(dir), "pages");
+  const read = (matched: ReturnType<FileSystemRouter["match"]>) => ({
+    name: matched!.name,
+    filePath: path.relative(pages, matched!.filePath).replaceAll("\\", "/"),
+    src: matched!.src,
+    kind: matched!.kind,
+    params: matched!.params,
+    query: matched!.query,
+  });
+  const router = routerOver(pages);
+  // Not read before the route table they came from is gone.
+  const matched = [router.match("/old"), router.match("/42/post?tab=a")];
+
+  fs.writeFileSync(path.join(pages, "new.tsx"), page);
+  fs.rmSync(path.join(pages, "old.tsx"));
+  fs.rmSync(path.join(pages, "[id]"), { recursive: true });
+  expect({ names: routeNames(router), old: router.match("/old")?.name, new: router.match("/new") }).toEqual({
+    names: ["/[id]/post", "/a", "/old"],
+    old: "/old",
+    new: null,
+  });
+
+  router.reload();
+  expect({ names: routeNames(router), old: router.match("/old"), new: router.match("/new")?.name }).toEqual({
+    names: ["/a", "/new"],
+    old: null,
+    new: "/new",
+  });
+  router.reload();
+  Bun.gc(true);
+  expect(matched.map(read)).toEqual([
+    { name: "/old", filePath: "old.tsx", src: "old.tsx", kind: "exact", params: {}, query: {} },
+    {
+      name: "/[id]/post",
+      filePath: "[id]/post.tsx",
+      src: "[id]/post.tsx",
+      kind: "dynamic",
+      params: { id: "42" },
+      query: { id: "42", tab: "a" },
+    },
+  ]);
+
+  // A match also outlives the router it came from.
+  const orphan = (() => routerOver(pages).match("/new"))();
+  Bun.gc(true);
+  expect(read(orphan)).toEqual({
+    name: "/new",
+    filePath: "new.tsx",
+    src: "new.tsx",
+    kind: "exact",
+    params: {},
+    query: {},
+  });
+});
+
+it("reload() keeps its routes while the directory is gone, and reads it again when it is back", () => {
+  using dir = tempDir("fsr-reload-root-gone", { "pages/a.tsx": page });
+  const pages = path.join(String(dir), "pages");
+  const router = routerOver(pages);
+
+  fs.rmSync(pages, { recursive: true });
+  expect(() => router.reload()).toThrow(
+    expect.objectContaining({ name: "Error", message: `Unable to find directory: ${pages}${path.sep}` }),
+  );
+  expect({ names: routeNames(router), match: router.match("/a")?.name }).toEqual({ names: ["/a"], match: "/a" });
+
+  fs.mkdirSync(pages);
+  fs.writeFileSync(path.join(pages, "b.tsx"), page);
+  router.reload();
+  expect(routeNames(router)).toEqual(["/b"]);
+});
+
+it("skips dot entries, node_modules and files with another extension", () => {
+  using dir = tempDir("fsr-skips", {
+    "pages/index.tsx": page,
+    "pages/a.tsx": page,
+    "pages/b.ts": page,
+    "pages/c.css": "",
+    "pages/README": "",
+    "pages/.hidden.tsx": page,
+    "pages/.hidden/x.tsx": page,
+    "pages/node_modules/pkg/index.tsx": page,
+    "pages/blog/index.tsx": page,
+    "pages/blog/[slug]/index.tsx": page,
+    "pages/blog/node_modules/x.tsx": page,
+  });
+  const pages = path.join(String(dir), "pages");
+  expect({
+    default: routesBelow(routerOver(pages), pages),
+    tsxOnly: routeNames(routerOver(pages, { fileExtensions: [".tsx"] })),
+  }).toEqual({
+    default: {
+      "/": "index.tsx",
+      "/a": "a.tsx",
+      "/b": "b.ts",
+      "/blog": "blog/index.tsx",
+      "/blog/[slug]": "blog/[slug]/index.tsx",
+    },
+    tsxOnly: ["/", "/a", "/blog", "/blog/[slug]"],
+  });
+});
+
+it("a route with uppercase letters keeps its case and matches a lowercase path", () => {
+  using dir = tempDir("fsr-uppercase", {
+    "pages/About.tsx": page,
+    "pages/Docs/Intro.tsx": page,
+    "pages/Users/index.tsx": page,
+    "pages/Users/[Id].tsx": page,
+  });
+  const pages = path.join(String(dir), "pages");
+  const router = routerOver(pages);
+  const match = (url: string) => {
+    const matched = router.match(url);
+    return matched && { name: matched.name, params: matched.params, src: matched.src };
+  };
+  expect({
+    names: routeNames(router),
+    exact: [match("/About"), match("/Docs/Intro"), match("/Users")],
+    lowercase: [match("/about"), match("/docs/intro"), match("/users"), match("/users/42")],
+  }).toEqual({
+    names: ["/About", "/Docs/Intro", "/Users", "/Users/[Id]"],
+    exact: [
+      { name: "/About", params: {}, src: "About.tsx" },
+      { name: "/Docs/Intro", params: {}, src: "Docs/Intro.tsx" },
+      { name: "/Users", params: {}, src: "Users/index.tsx" },
+    ],
+    lowercase: [
+      { name: "/About", params: {}, src: "About.tsx" },
+      { name: "/Docs/Intro", params: {}, src: "Docs/Intro.tsx" },
+      { name: "/Users", params: {}, src: "Users/index.tsx" },
+      { name: "/Users/[Id]", params: { Id: "42" }, src: "Users/[Id].tsx" },
+    ],
+  });
+});
+
+it("a dir that is a file is a directory that is not found", () => {
+  using dir = tempDir("fsr-root-is-file", { "file.tsx": page });
+  const file = path.join(String(dir), "file.tsx");
+  expect(() => routerOver(file)).toThrow(
+    expect.objectContaining({ name: "Error", message: `Unable to find directory: ${file}` }),
+  );
+});
+
+it.skipIf(isWindows)("a dir that cannot be opened is an error, a subdirectory that cannot be is left out", async () => {
+  using dir = tempDir("fsr-no-access", {
+    "locked/a.tsx": page,
+    "pages/a.tsx": page,
+    "pages/private/b.tsx": page,
+  });
+  const locked = [path.join(String(dir), "locked"), path.join(String(dir), "pages", "private")];
+  // Root ignores the mode of a directory, so the child does not run as root.
+  using unprivileged = unprivilegedSpawnOptions(String(dir));
+  for (const directory of locked) fs.chmodSync(directory, 0o000);
+  try {
+    await using proc = Bun.spawn({
+      cmd: [
+        bunExe(),
+        "-e",
+        `
+        const router = dir => new Bun.FileSystemRouter({ style: "nextjs", dir });
+        let error;
+        try {
+          router("locked");
+        } catch (e) {
+          error = { code: e.code, syscall: e.syscall, path: require("path").basename(e.path ?? "") };
+        }
+        console.log(JSON.stringify({ error, pages: Object.keys(router("pages").routes) }));
+        `,
+      ],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+      ...unprivileged,
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    expect({ stdout: stdout.trim(), stderr, exitCode }).toEqual({
+      stdout: JSON.stringify({ error: { code: "EACCES", syscall: "open", path: "locked" }, pages: ["/a"] }),
+      stderr: "",
+      exitCode: 0,
+    });
+  } finally {
+    for (const directory of locked) fs.chmodSync(directory, 0o755);
+  }
+});
+
+it.skipIf(isWindows)("follows a link to a file and a link to a directory", () => {
+  using dir = tempDir("fsr-links", {
+    "pages/a.tsx": page,
+    "elsewhere/target.tsx": page,
+    "elsewhere/folder/x.tsx": page,
+    "elsewhere/folder/deep/y.tsx": page,
+  });
+  const root = String(dir);
+  const pages = path.join(root, "pages");
+  fs.symlinkSync(path.join(root, "elsewhere", "target.tsx"), path.join(pages, "s.tsx"));
+  fs.symlinkSync(path.join(root, "elsewhere", "folder"), path.join(pages, "ln"));
+
+  // The name comes from the link. The file path and `src` are those of the file the link leads to.
+  const router = routerOver(pages);
+  expect({
+    routes: routesBelow(router, root),
+    src: [router.match("/s")!.src, router.match("/ln/x")!.src, router.match("/ln/deep/y")!.src],
+  }).toEqual({
+    routes: {
+      "/a": "pages/a.tsx",
+      "/ln/deep/y": "elsewhere/folder/deep/y.tsx",
+      "/ln/x": "elsewhere/folder/x.tsx",
+      "/s": "elsewhere/target.tsx",
+    },
+    src: ["../elsewhere/target.tsx", "../elsewhere/folder/x.tsx", "../elsewhere/folder/deep/y.tsx"],
+  });
+});
+
+it.skipIf(isWindows)("skips a link to nothing, a FIFO and a link to a FIFO", async () => {
+  using dir = tempDir("fsr-not-a-file", { "pages/a.tsx": page });
+  const root = String(dir);
+  const pages = path.join(root, "pages");
+  fs.symlinkSync(path.join(root, "nowhere.tsx"), path.join(pages, "dangling.tsx"));
+  expect(Bun.spawnSync(["mkfifo", path.join(pages, "fifo.tsx"), path.join(root, "fifo-target")]).exitCode).toBe(0);
+  fs.symlinkSync(path.join(root, "fifo-target"), path.join(pages, "link-to-fifo.tsx"));
+
+  // In a subprocess: a router that opens a FIFO to learn its path never returns.
+  await using proc = Bun.spawn({
+    cmd: [
+      bunExe(),
+      "-e",
+      `console.log(Object.keys(new Bun.FileSystemRouter({ style: "nextjs", dir: process.argv[1] }).routes).join(" "));`,
+      pages,
+    ],
+    env: bunEnv,
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: 30_000,
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  expect({ stdout, stderr, exitCode, signalCode: proc.signalCode }).toEqual({
+    stdout: "/a\n",
+    stderr: "",
+    exitCode: 0,
+    signalCode: null,
+  });
+});
+
+it.skipIf(isWindows)("a link that leads back into the tree is not followed again", () => {
+  using dir = tempDir("fsr-link-cycle", { "one/a.tsx": page, "two/a.tsx": page, "two/sub/b.tsx": page });
+  const [one, two] = [path.join(String(dir), "one"), path.join(String(dir), "two")];
+  fs.symlinkSync(".", path.join(one, "self"));
+  fs.symlinkSync("..", path.join(two, "sub", "up"));
+  expect({ one: routeNames(routerOver(one)), two: routeNames(routerOver(two)) }).toEqual({
+    one: ["/a"],
+    two: ["/a", "/sub/b"],
+  });
+});
+
+it.skipIf(isWindows)("a chain of links ends where a route name is as long as a path can be", async () => {
+  // Each link adds 51 bytes to the name of a route and leads to a directory with a short path,
+  // so the length of a path does not end the walk. The whole chain makes a name of 71,400 bytes.
+  using dir = tempDir("fsr-link-chain", {
+    "fixture.ts": /* ts */ `
+      import fs from "fs";
+      import path from "path";
+      const root = import.meta.dir;
+      const link = Buffer.alloc(50, "l").toString();
+      fs.mkdirSync(path.join(root, "pages"));
+      for (let i = 0; i < 1400; i++) {
+        fs.mkdirSync(path.join(root, "d" + i));
+        fs.writeFileSync(path.join(root, "d" + i, "p.tsx"), "");
+        fs.symlinkSync(path.join(root, "d" + i), path.join(root, i === 0 ? "pages" : "d" + (i - 1), link));
+      }
+      const names = Object.keys(new Bun.FileSystemRouter({ style: "nextjs", dir: path.join(root, "pages") }).routes);
+      console.log(JSON.stringify({ routes: names.length, longest: Math.max(...names.map(name => name.length)) }));
+    `,
+  });
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "fixture.ts"],
+    env: bunEnv,
+    cwd: String(dir),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  // A route's directory and file name are shorter than PATH_MAX: 4096 bytes on Linux, 1024 on macOS.
+  const expected = isLinux ? { routes: 80, longest: 4082 } : { routes: 19, longest: 971 };
+  expect({ stdout, stderr, exitCode, signalCode: proc.signalCode }).toEqual({
+    stdout: JSON.stringify(expected) + "\n",
+    stderr: "",
+    exitCode: 0,
+    signalCode: null,
+  });
+});
+
+it("a tsconfig.json or package.json that does not parse is not the router's error", () => {
+  using dir = tempDir("fsr-broken-config", {
+    "tsconfig.json": `{ "compilerOptions": { "paths": `,
+    "pages/a.tsx": page,
+    "pages/package.json": `{ "name": `,
+    "pages/sub/b.tsx": page,
+    "pages/sub/tsconfig.json": `{ "compilerOptions": `,
+  });
+  expect(routeNames(routerOver(path.join(String(dir), "pages")))).toEqual(["/a", "/sub/b"]);
+});
+
+it("reload() and new routers in a loop keep no memory of the scans before", async () => {
+  const files: Record<string, string> = {};
+  for (let i = 0; i < 50; i++) files[`pages/folder-${i}/Route-${i}.tsx`] = "";
+  using dir = tempDir("fsr-scan-memory", files);
+
+  // Each reload() used to leave the resolver's records of 51 directories behind: about 420 KB.
+  const code = /* ts */ `
+    const options = { style: "nextjs", dir: ${JSON.stringify(path.join(String(dir), "pages"))} };
+    const router = new Bun.FileSystemRouter(options);
+    const scan = count => {
+      for (let i = 0; i < count; i++) {
+        router.reload();
+        new Bun.FileSystemRouter(options);
+      }
+      Bun.gc(true);
+    };
+    scan(20);
+    const before = process.memoryUsage.rss();
+    scan(100);
+    console.log(JSON.stringify({ deltaMiB: (process.memoryUsage.rss() - before) / 1024 / 1024 }));
+  `;
+  await expectRssDeltaBelow(["-e", code], { release: 10, debug: 10 });
+});
+
+describe("two files for one route", () => {
+  it("the first in byte order defines a route, the next is an error", () => {
+    using dir = tempDir("fsr-duplicate", { "pages/a.tsx": page, "pages/a.ts": page, "pages/b.tsx": page });
+    const pages = path.join(String(dir), "pages");
+    let message = "";
+    try {
+      routerOver(pages);
+    } catch (e) {
+      message = (e as Error).message.replaceAll("\\", "/").replaceAll(pages.replaceAll("\\", "/"), "<pages>");
+    }
+    expect(message).toBe(`Route "/a" is already defined by <pages>/a.ts`);
+  });
+
+  it("the first index file in byte order is the index route", () => {
+    using dir = tempDir("fsr-index-files", {
+      "pages/index.tsx": page,
+      "pages/index.ts": page,
+      "pages/index.js": page,
+      "pages/index.jsx": page,
+    });
+    const pages = path.join(String(dir), "pages");
+    const router = routerOver(pages);
+    expect({ routes: routesBelow(router, pages), match: path.relative(pages, router.match("/")!.filePath) }).toEqual({
+      routes: { "/": "index.js" },
+      match: "index.js",
+    });
+  });
+
+  // Names that differ only in case are one name on macOS and Windows.
+  it.skipIf(!isLinux)("names that differ only in case are the same route, directories are not", () => {
+    using dir = tempDir("fsr-case", {
+      "files/A.tsx": page,
+      "files/a.tsx": page,
+      "dirs/Blog/x.tsx": page,
+      "dirs/blog/y.tsx": page,
+    });
+    const root = String(dir);
+    let message = "";
+    try {
+      routerOver(path.join(root, "files"));
+    } catch (e) {
+      message = (e as Error).message.replaceAll(root, "<root>");
+    }
+    expect({ message, dirs: routeNames(routerOver(path.join(root, "dirs"))) }).toEqual({
+      message: `Route "/a" is already defined by <root>/files/A.tsx`,
+      dirs: ["/Blog/x", "/blog/y"],
+    });
+  });
+});
+
+describe("dir is reached through a link", () => {
+  async function run(fixture: string, files: Record<string, string>, link: [target: string, name: string]) {
+    using dir = tempDir("fsr-linked-dir", { "fixture.ts": fixture, ...files });
+    fs.symlinkSync(path.join(String(dir), link[0]), path.join(String(dir), link[1]), "junction");
+    await using proc = Bun.spawn({
+      cmd: [bunExe(), "fixture.ts"],
+      env: bunEnv,
+      cwd: String(dir),
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+    return {
+      stdout: normalizeBunSnapshot(stdout, String(dir)),
+      stderr: normalizeBunSnapshot(stderr, String(dir)),
+      exitCode,
+      signalCode: proc.signalCode,
+    };
+  }
+  const names = `const names = router => Object.keys(router.routes).sort().join(" ");`;
+
+  it("reload() names the routes as the constructor does", async () => {
+    const result = await run(
+      /* ts */ `
+        import path from "path";
+        ${names}
+        const dir = path.join(import.meta.dir, "link", "pages");
+        const router = new Bun.FileSystemRouter({ dir, style: "nextjs", fileExtensions: [".tsx"] });
+        const before = names(router);
+        router.reload();
+        const again = new Bun.FileSystemRouter({ dir, style: "nextjs", fileExtensions: [".tsx"] });
+        console.log([before, names(router), router.match("/sub/c")?.name, router.match("/")?.name, names(again)].join(" | "));
+      `,
+      { "real/pages/index.tsx": page, "real/pages/b.tsx": page, "real/pages/sub/c.tsx": page },
+      ["real", "link"],
+    );
+    expect(result).toEqual({
+      stdout: "/ /b /sub/c | / /b /sub/c | /sub/c | / | / /b /sub/c",
+      stderr: "",
+      exitCode: 0,
+      signalCode: null,
+    });
+  });
+
+  it("reload() follows the link to where it leads now", async () => {
+    const result = await run(
+      /* ts */ `
+        import fs from "fs";
+        import path from "path";
+        ${names}
+        const link = path.join(import.meta.dir, "link");
+        const router = new Bun.FileSystemRouter({ dir: path.join(link, "pages"), style: "nextjs" });
+        const before = names(router);
+        // A junction is a directory to Windows.
+        if (process.platform === "win32") fs.rmdirSync(link);
+        else fs.unlinkSync(link);
+        fs.symlinkSync(path.join(import.meta.dir, "second"), link, "junction");
+        router.reload();
+        const match = router.match("/two");
+        console.log([before, names(router), path.relative(import.meta.dir, match.filePath).replaceAll("\\\\", "/"), match.src].join(" | "));
+      `,
+      { "first/pages/one.tsx": page, "second/pages/two.tsx": page },
+      ["first", "link"],
+    );
+    expect(result).toEqual({
+      stdout: "/one | /two | second/pages/two.tsx | two.tsx",
+      stderr: "",
+      exitCode: 0,
+      signalCode: null,
+    });
+  });
+});
+
+it("reload() returns when the resolver has dir cached without a trailing separator", async () => {
+  // The failed resolve and the router over `sub` leave `pages` cached without a trailing separator.
+  using dir = tempDir("fsr-reload-failed-resolve", {
+    "fixture.ts": /* ts */ `
+      import path from "path";
+      const pagesDir = path.join(import.meta.dir, "pages");
+      try {
+        Bun.resolveSync("./does-not-exist.ts", pagesDir);
+      } catch {}
+      new Bun.FileSystemRouter({ dir: path.join(pagesDir, "sub"), style: "nextjs", fileExtensions: [".tsx"] });
+      const router = new Bun.FileSystemRouter({ dir: pagesDir, style: "nextjs", fileExtensions: [".tsx"] });
+      const before = Object.keys(router.routes).sort().join(" ");
+      router.reload();
+      console.log(before, "|", Object.keys(router.routes).sort().join(" "), router.match("/")?.name);
+    `,
+    "pages/index.tsx": "export default 1;\n",
+    "pages/b.tsx": "export default 2;\n",
+    "pages/sub/c.tsx": "export default 3;\n",
+  });
+
+  await using proc = Bun.spawn({
+    cmd: [bunExe(), "fixture.ts"],
+    env: bunEnv,
+    cwd: String(dir),
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, exitCode] = await Promise.all([proc.stdout.text(), proc.stderr.text(), proc.exited]);
+  expect({
+    stdout: normalizeBunSnapshot(stdout, String(dir)),
+    stderr: normalizeBunSnapshot(stderr, String(dir)),
+    exitCode,
+    signalCode: proc.signalCode,
+  }).toEqual({ stdout: "/ /b /sub/c | / /b /sub/c /", stderr: "", exitCode: 0, signalCode: null });
 });
