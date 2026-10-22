@@ -957,6 +957,7 @@ impl DirListing {
 /// `dir`, a separator and `name`, byte for byte: a normalizing join would rewrite a name.
 fn join_path(out: &mut Vec<u8>, dir: &[u8], name: &[u8]) {
     out.clear();
+    out.reserve(dir.len() + 1 + name.len());
     out.extend_from_slice(dir);
     if dir.last() != Some(&SEP) {
         out.push(SEP);
