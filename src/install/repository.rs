@@ -133,17 +133,13 @@ pub(crate) fn github_tarball_tag(owner: &[u8], repo: &[u8], commit: &[u8]) -> Op
     is_safe_resolved_tag(&tag).then_some(tag)
 }
 
-/// `resolved` from its last `-`. Earlier versions wrote this after the `#` of a package, commit or
-/// not.
+/// `resolved` from its last `-`: what earlier versions wrote after the `#`, commit or not.
 fn resolved_tail(resolved: &[u8]) -> &[u8] {
     let dash = strings::last_index_of_char(resolved, b'-');
     &resolved[dash.map_or(0, |dash| dash + 1)..]
 }
 
-/// True when `tail`, the end of `resolved`, is a commit. GitHub names the root folder of a tarball
-/// `<owner>-<repo>-<commit>`, with 7 digits of the commit or with all of them. A git checkout and
-/// a row migrated from another lockfile have the commit alone. Another host can name the root
-/// folder after anything, for example after the repository.
+/// True for the end of GitHub's tarball root (`<owner>-<repo>-<7 hex>`) and for a whole commit.
 fn names_commit(resolved: &[u8], tail: &[u8]) -> bool {
     let has_commit_len = match tail.len() {
         7 => tail.len() < resolved.len(),
@@ -164,11 +160,9 @@ pub trait RepositoryExt: Sized {
     fn fmt_store_path<'a>(&'a self, label: &'a str, string_buf: &'a [u8])
     -> StorePathFormatter<'a>;
     fn fmt<'a>(&'a self, label: &'a str, buf: &'a [u8]) -> Formatter<'a>;
-    /// The text of the package in the hash that `bun.lockb` stores. There every release cuts
-    /// `resolved` at its last `-`, commit or not, and a saved hash has to keep matching.
+    /// The text in the `bun.lockb` hash, where every release cuts `resolved` at its last `-`.
     fn fmt_hashed<'a>(&'a self, label: &'a str, buf: &'a [u8]) -> Formatter<'a>;
-    /// The commit that `resolved` ends in, else the committish as written. bun.lock saves this
-    /// after the `#` of the package, and reads it back as the committish.
+    /// What bun.lock saves after the `#`: the commit that `resolved` ends in, else the committish.
     fn locked_committish<'a>(&'a self, buf: &'a [u8]) -> &'a [u8];
     /// The ssh form of a git URL; `None` for an explicit `http(s)://` URL.
     fn try_ssh(url: &[u8]) -> Option<Vec<u8>>;
@@ -282,8 +276,7 @@ impl RepositoryExt for Repository {
             return committish;
         }
         let tail = resolved_tail(resolved);
-        // A row that bun.lock saved has the tail already. Bun before 1.4 misreads other bytes
-        // after the `#` (#24017), so a committish that has them keeps the tail.
+        // Bun before 1.4 misreads other bytes after the `#` (#24017): those keep the tail.
         if committish == tail || names_commit(resolved, tail) || !is_tag_text(committish) {
             tail
         } else {

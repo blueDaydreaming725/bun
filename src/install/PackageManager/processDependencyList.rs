@@ -170,8 +170,7 @@ impl PackageManager {
             *package_id = existing_id;
             let mut existing = *self.lockfile.packages.get(existing_id as usize);
             let from_lockfile = existing_id < self.lockfile.loaded_package_count;
-            // A `resolved` that names no commit is the same for every ref. The lockfile has one
-            // ref of the package, and another one was downloaded.
+            // Every ref has this `resolved` when it names no commit, and another ref was fetched.
             let relocked = existing.resolution.tag.is_git() && {
                 let buf = self.lockfile.buffers.string_bytes.as_slice();
                 let (locked, fetched) = (
