@@ -220,11 +220,13 @@ fn apply_barrel_optimization_impl(
             if !needed_records.contains(&iri) {
                 if (iri as usize) < ast.import_records.len() {
                     let flags = ast.import_records.as_slice()[iri as usize].flags;
-                    // A record the parser dropped has no names: un-deferring it would resolve it.
-                    debug_assert!(
-                        !flags.contains(import_record::Flags::IS_UNUSED)
-                            || flags.contains(import_record::Flags::IS_BARREL_DEFERRED)
-                    );
+                    // Deferred for an earlier name.
+                    if flags.contains(import_record::Flags::IS_BARREL_DEFERRED) {
+                        continue;
+                    }
+                    // No name leads to a record that the parser dropped or merged away.
+                    // A request would un-defer and resolve such a record.
+                    debug_assert!(!flags.contains(import_record::Flags::IS_UNUSED));
                     // A merged statement also stands for statements that export none
                     // of their names. No request can reach those, so the record stays.
                     if flags.contains(import_record::Flags::MERGED_IMPORT_WITHOUT_BINDINGS)
