@@ -121,9 +121,22 @@ pub(crate) fn is_safe_resolved_tag(resolved: &[u8]) -> bool {
 }
 
 /// True when `text` has only the bytes that a `resolved` tag can have.
-fn is_tag_text(text: &[u8]) -> bool {
+pub(crate) fn is_tag_text(text: &[u8]) -> bool {
     text.iter()
         .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
+/// True for the text of a commit: the 7 hex digits that GitHub's tarball root has, or all 40 or 64.
+pub(crate) fn is_commit(text: &[u8]) -> bool {
+    matches!(text.len(), 7 | 40 | 64) && text.iter().all(u8::is_ascii_hexdigit)
+}
+
+/// `resolved` from its last `-`: the end of the label, patch key and store name of a package.
+fn resolved_tail(resolved: &[u8]) -> &[u8] {
+    match strings::last_index_of_char(resolved, b'-') {
+        Some(i) => &resolved[i + 1..],
+        None => resolved,
+    }
 }
 
 /// The name of the root folder in GitHub's tarball of `commit`. A fresh install records that name
@@ -131,22 +144,6 @@ fn is_tag_text(text: &[u8]) -> bool {
 pub(crate) fn github_tarball_tag(owner: &[u8], repo: &[u8], commit: &[u8]) -> Option<Vec<u8>> {
     let tag = [owner, b"-", repo, b"-", &commit[..commit.len().min(7)]].concat();
     is_safe_resolved_tag(&tag).then_some(tag)
-}
-
-/// `resolved` from its last `-`: what earlier versions wrote after the `#`, commit or not.
-fn resolved_tail(resolved: &[u8]) -> &[u8] {
-    let dash = strings::last_index_of_char(resolved, b'-');
-    &resolved[dash.map_or(0, |dash| dash + 1)..]
-}
-
-/// True for the end of GitHub's tarball root (`<owner>-<repo>-<7 hex>`) and for a whole commit.
-fn names_commit(resolved: &[u8], tail: &[u8]) -> bool {
-    let has_commit_len = match tail.len() {
-        7 => tail.len() < resolved.len(),
-        40 | 64 => true,
-        _ => false,
-    };
-    has_commit_len && tail.iter().all(u8::is_ascii_hexdigit)
 }
 
 /// Install-tier `Repository` behaviour: parsing, formatting, clone URL forms.
@@ -160,10 +157,12 @@ pub trait RepositoryExt: Sized {
     fn fmt_store_path<'a>(&'a self, label: &'a str, string_buf: &'a [u8])
     -> StorePathFormatter<'a>;
     fn fmt<'a>(&'a self, label: &'a str, buf: &'a [u8]) -> Formatter<'a>;
-    /// The text in the `bun.lockb` hash, where every release cuts `resolved` at its last `-`.
-    fn fmt_hashed<'a>(&'a self, label: &'a str, buf: &'a [u8]) -> Formatter<'a>;
-    /// What bun.lock saves after the `#`: the commit that `resolved` ends in, else the committish.
-    fn locked_committish<'a>(&'a self, buf: &'a [u8]) -> &'a [u8];
+    /// The commit that `resolved` names, when it names one.
+    fn resolved_commit<'a>(&'a self, buf: &'a [u8]) -> Option<&'a [u8]>;
+    /// The ref that a download of this package asks for: its commit, else its committish.
+    fn pinned_ref<'a>(&'a self, buf: &'a [u8]) -> &'a [u8];
+    /// A copy that prints `pinned_ref` after the `#`, for text that is read back as a ref.
+    fn pinned(&self, buf: &[u8]) -> Repository;
     /// The ssh form of a git URL; `None` for an explicit `http(s)://` URL.
     fn try_ssh(url: &[u8]) -> Option<Vec<u8>>;
     /// The https form of a git URL, or `None` when it has none.
@@ -228,7 +227,12 @@ impl RepositoryExt for Repository {
     }
 
     fn format_as(&self, label: &str, buf: &[u8], writer: &mut impl fmt::Write) -> fmt::Result {
-        write!(writer, "{}", self.fmt(label, buf))
+        let formatter = Formatter {
+            label,
+            repository: self,
+            buf,
+        };
+        write!(writer, "{}", formatter)
     }
 
     fn fmt_store_path<'a>(
@@ -244,43 +248,38 @@ impl RepositoryExt for Repository {
     }
 
     fn fmt<'a>(&'a self, label: &'a str, buf: &'a [u8]) -> Formatter<'a> {
-        let committish = self.locked_committish(buf);
         Formatter {
             repository: self,
             buf,
             label,
-            committish: (!committish.is_empty()).then_some(committish),
         }
     }
 
-    fn fmt_hashed<'a>(&'a self, label: &'a str, buf: &'a [u8]) -> Formatter<'a> {
+    fn resolved_commit<'a>(&'a self, buf: &'a [u8]) -> Option<&'a [u8]> {
         let resolved = self.resolved.slice(buf);
-        let committish = self.committish.slice(buf);
-        Formatter {
-            repository: self,
-            buf,
-            label,
-            committish: if resolved.is_empty() {
-                (!committish.is_empty()).then_some(committish)
-            } else {
-                Some(resolved_tail(resolved))
-            },
-        }
-    }
-
-    fn locked_committish<'a>(&'a self, buf: &'a [u8]) -> &'a [u8] {
-        let committish = self.committish.slice(buf);
-        let resolved = self.resolved.slice(buf);
-        // A row from another lockfile has the committish of that lockfile as its `resolved`.
-        if resolved.is_empty() || resolved == committish {
-            return committish;
-        }
-        let tail = resolved_tail(resolved);
-        // Bun before 1.4 misreads other bytes after the `#` (#24017): those keep the tail.
-        if committish == tail || names_commit(resolved, tail) || !is_tag_text(committish) {
-            tail
+        // A row from another lockfile has its committish as `resolved`, and that is a ref.
+        let tail = if resolved == self.committish.slice(buf) {
+            resolved
         } else {
-            committish
+            resolved_tail(resolved)
+        };
+        // Seven digits are a commit only at the end of a tarball root.
+        let is_short = tail.len() == 7;
+        (is_commit(tail) && (!is_short || tail.len() < resolved.len())).then_some(tail)
+    }
+
+    fn pinned_ref<'a>(&'a self, buf: &'a [u8]) -> &'a [u8] {
+        self.resolved_commit(buf)
+            .unwrap_or(self.committish.slice(buf))
+    }
+
+    fn pinned(&self, buf: &[u8]) -> Repository {
+        match self.resolved_commit(buf) {
+            Some(_) => *self,
+            None => Repository {
+                resolved: Default::default(),
+                ..*self
+            },
         }
     }
 
@@ -385,10 +384,17 @@ impl<'a> fmt::Display for StorePathFormatter<'a> {
             fmt_store_url(self.repo.repo.slice(self.string_buf))
         )?;
 
-        let committish = self.repo.locked_committish(self.string_buf);
-        if !committish.is_empty() {
+        if !self.repo.resolved.is_empty() {
             writer.write_str("+")?; // this would be '#' but it's not valid on windows
-            write!(writer, "{}", bun_semver::string::fmt_store_path(committish))?;
+            let resolved = resolved_tail(self.repo.resolved.slice(self.string_buf));
+            write!(writer, "{}", bun_semver::string::fmt_store_path(resolved))?;
+        } else if !self.repo.committish.is_empty() {
+            writer.write_str("+")?; // this would be '#' but it's not valid on windows
+            write!(
+                writer,
+                "{}",
+                self.repo.committish.fmt_store_path(self.string_buf)
+            )?;
         }
         Ok(())
     }
@@ -398,8 +404,6 @@ pub struct Formatter<'a> {
     label: &'a str,
     buf: &'a [u8],
     repository: &'a Repository,
-    /// What follows the `#`, when the text has one.
-    committish: Option<&'a [u8]>,
 }
 
 impl<'a> fmt::Display for Formatter<'a> {
@@ -420,9 +424,17 @@ impl<'a> fmt::Display for Formatter<'a> {
         }
         write!(writer, "{}", BStr::new(repo))?;
 
-        if let Some(committish) = self.committish {
+        if !self.repository.resolved.is_empty() {
             writer.write_str("#")?;
-            write!(writer, "{}", BStr::new(committish))?;
+            let resolved = resolved_tail(self.repository.resolved.slice(self.buf));
+            write!(writer, "{}", BStr::new(resolved))?;
+        } else if !self.repository.committish.is_empty() {
+            writer.write_str("#")?;
+            write!(
+                writer,
+                "{}",
+                BStr::new(self.repository.committish.slice(self.buf))
+            )?;
         }
         Ok(())
     }
