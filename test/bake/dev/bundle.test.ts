@@ -1657,10 +1657,7 @@ const needsModuleStatements = [
   `export {} from 'PKG';`,
   `import { helper } from 'PKG'; globalThis.helped = helper;`,
   `import { helper } from 'PKG';`,
-].flatMap(statement => [
-  `${statement} export { a } from 'PKG';`,
-  `export { a } from 'PKG'; ${statement}`,
-]);
+].flatMap(statement => [`${statement} export { a } from 'PKG';`, `export { a } from 'PKG'; ${statement}`]);
 
 devTest("barrel optimization: a statement of a shared path that exports no name keeps its module", {
   files: {
@@ -1674,8 +1671,7 @@ devTest("barrel optimization: a statement of a shared path that exports no name 
       {},
       ...needsModuleStatements.map((statements, i) => ({
         [`node_modules/needs-${i}/package.json`]: sideEffectsFalse(`needs-${i}`),
-        [`node_modules/needs-${i}/index.js`]:
-          `${statements.replaceAll("PKG", `needed-${i}`)} export { keep } from './keep.js';`,
+        [`node_modules/needs-${i}/index.js`]: `${statements.replaceAll("PKG", `needed-${i}`)} export { keep } from './keep.js';`,
         [`node_modules/needs-${i}/keep.js`]: `export const keep = "K";`,
         [`node_modules/needed-${i}/package.json`]: JSON.stringify({ name: `needed-${i}`, main: "./index.js" }),
         [`node_modules/needed-${i}/index.js`]: `

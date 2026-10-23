@@ -341,8 +341,8 @@ impl<'a> ImportScanner<'a> {
                         }
                     );
                     if HOT_MODULE_RELOADING_TRANSFORMATIONS {
-                        record = &raw mut p.import_records.items_mut()
-                            [st.import_record_index as usize];
+                        record =
+                            &raw mut p.import_records.items_mut()[st.import_record_index as usize];
                     }
 
                     let namespace_ref = st.namespace_ref;
