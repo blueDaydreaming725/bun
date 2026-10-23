@@ -220,27 +220,32 @@ fn apply_barrel_optimization_impl(
             if !needed_records.contains(&iri) {
                 if (iri as usize) < ast.import_records.len() {
                     let flags = ast.import_records.as_slice()[iri as usize].flags;
-                    // Deferred for an earlier name.
-                    if flags.contains(import_record::Flags::IS_BARREL_DEFERRED) {
-                        continue;
-                    }
-                    // No name leads to a record that the parser dropped or merged away.
-                    // A request would un-defer and resolve such a record.
-                    debug_assert!(!flags.contains(import_record::Flags::IS_UNUSED));
-                    // A merged statement also stands for statements that export none
-                    // of their names. No request can reach those, so the record stays.
-                    if flags.contains(import_record::Flags::MERGED_IMPORT_WITHOUT_BINDINGS)
-                        || (flags.contains(import_record::Flags::MERGED_IMPORT_WITH_BINDINGS)
-                            && imports_unexported_name(
+                    if flags.intersects(
+                        import_record::Flags::IS_BARREL_DEFERRED
+                            | import_record::Flags::MERGED_IMPORT_WITH_BINDINGS
+                            | import_record::Flags::MERGED_IMPORT_WITHOUT_BINDINGS,
+                    ) {
+                        // Deferred for an earlier name.
+                        if flags.contains(import_record::Flags::IS_BARREL_DEFERRED) {
+                            continue;
+                        }
+                        // A merged statement also stands for statements that export none
+                        // of their names. No request can reach those, so the record stays.
+                        if flags.contains(import_record::Flags::MERGED_IMPORT_WITHOUT_BINDINGS)
+                            || imports_unexported_name(
                                 iri,
                                 &ast.named_exports,
                                 &ast.named_imports,
                                 &mut reexported,
-                            )?)
-                    {
-                        needed_records.put(iri, ())?;
-                        continue;
+                            )?
+                        {
+                            needed_records.put(iri, ())?;
+                            continue;
+                        }
                     }
+                    // No name leads to a record that the parser dropped or merged away.
+                    // A request would un-defer and resolve such a record.
+                    debug_assert!(!flags.contains(import_record::Flags::IS_UNUSED));
                     ast.import_records.as_mut_slice()[iri as usize]
                         .flags
                         .insert(
