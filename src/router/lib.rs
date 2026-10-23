@@ -49,9 +49,7 @@ pub use route_param::Param;
 
 const BANNED_DIRS: [&[u8]; 1] = [b"node_modules"];
 
-/// A route's directory and file name, below the routes directory, are together shorter than this.
-/// A link adds its name to them and not to the path the walk opens, so a chain of links would
-/// pass the length of any path, and then what `pattern::RoutePathInt` counts.
+/// Bounds a route's name: a link adds to it and not to the path the walk opens, so no path length ends a chain of links.
 const MAX_PUBLIC_PATH_LEN: usize = if MAX_PATH_BYTES < pattern::RoutePathInt::MAX as usize {
     MAX_PATH_BYTES
 } else {
@@ -63,11 +61,11 @@ const MAX_PUBLIC_PATH_LEN: usize = if MAX_PATH_BYTES < pattern::RoutePathInt::MA
 // accessors. Hand-rolled SoA struct until the derive exists.
 struct RouteIndexList {
     // The `Box` is load-bearing: `Routes::index` / `Routes::static_` hold
-    // `NonNull<Route>` / `*const Route` into the box interiors, and the three
-    // columns below hold slices of each route's own strings; unboxing would
-    // dangle them on `Vec` realloc.
+    // `NonNull<Route>` / `*const Route` into the box interiors; unboxing
+    // would dangle them on `Vec` realloc.
     #[expect(clippy::vec_box)]
     route: Vec<Box<Route>>,
+    /// Bytes of the route's own strings, as the next two columns are.
     name: Vec<RawSlice<u8>>,
     match_name: Vec<RawSlice<u8>>,
     filepath: Vec<RawSlice<u8>>,
@@ -132,26 +130,17 @@ pub struct Routes {
     /// no borrow it doesn't actually take; matches `static_` above.
     pub(crate) index: Option<NonNull<Route>>,
 
-    /// Real path of the routes directory, spelled like `Route::abs_path` and with a `/` at the
-    /// end: the path of a file in the directory starts with it.
+    /// Real path of the routes directory, spelled like `Route::abs_path`, with a `/` at the end.
     dir: Box<[u8]>,
 }
 
 impl Routes {
-    /// Reads `dir` and the tree below it from disk, never from a cache. `Ok(None)`: there is no
-    /// directory at `dir`.
-    ///
-    /// The walk leaves out a name that is gone or that may not be read. Every other error ends
-    /// the scan: the routes without that name would not be the tree on disk. `log` gets an error
-    /// for each route file that is left out because of its name.
-    ///
-    /// `each_dir` gets each directory that is read: its path below `dir`, which is empty or like
-    /// `/blog/[slug]`, and its real path.
+    /// Reads `dir` and the tree below it from disk, never from a cache. `None`: there is no directory at `dir`.
     pub fn scan(
         dir: &[u8],
         extensions: &[Box<[u8]>],
         log: &mut bun_ast::Log,
-        each_dir: &mut dyn FnMut(&[u8], &[u8]),
+        each_dir: EachDir<'_>,
     ) -> bun_sys::Result<Option<Routes>> {
         let root = match WalkedDir::root(dir) {
             Ok(root) => root,
@@ -173,17 +162,7 @@ impl Routes {
             routes_dir.push(b'/');
         }
 
-        let mut loader = RouteLoader {
-            extensions,
-            log,
-            each_dir,
-            public_dir: Vec::new(),
-            path: Vec::new(),
-            dedupe_dynamic: StringHashMap::new(),
-            index: None,
-            static_list: StringHashMap::new(),
-            all_routes: Vec::new(),
-        };
+        let mut loader = RouteLoader::new(extensions, log, each_dir);
         loader.load(root)?;
         Ok(Some(loader.finish(routes_dir.into_boxed_slice())))
     }
@@ -317,6 +296,9 @@ impl Routes {
     }
 }
 
+/// Gets each directory a scan reads: its path below the routes directory (empty, or `/blog/[slug]`) and its real path.
+pub type EachDir<'a> = &'a mut dyn FnMut(&[u8], &[u8]);
+
 /// A directory the walk is inside of.
 struct WalkedDir {
     listing: DirListing,
@@ -344,8 +326,7 @@ impl WalkedDir {
     }
 }
 
-/// `None` for an error that says a name is gone or may not be read: the walk leaves such a name
-/// out. Every other error ends the scan, and names `path`.
+/// `None` for an error that says a name is gone or may not be read, which the walk leaves out. Any other error ends the scan.
 fn unless_skippable<T>(result: bun_sys::Result<T>, path: &[u8]) -> bun_sys::Result<Option<T>> {
     match result {
         Ok(value) => Ok(Some(value)),
@@ -384,7 +365,7 @@ fn link_target<'b>(path: &ZStr, buf: &'b mut bun_paths::PathBuffer) -> bun_sys::
 struct RouteLoader<'a> {
     extensions: &'a [Box<[u8]>],
     log: &'a mut bun_ast::Log,
-    each_dir: &'a mut dyn FnMut(&[u8], &[u8]),
+    each_dir: EachDir<'a>,
 
     /// The directory being read, below the routes directory: empty, or `/blog/[slug]`.
     public_dir: Vec<u8>,
@@ -396,13 +377,27 @@ struct RouteLoader<'a> {
     /// The place of the index route in `all_routes`, and of its file's extension in `extensions`.
     index: Option<(usize, usize)>,
     static_list: StringHashMap<*const Route>,
-    // `Box` is load-bearing: `static_list` above and `Routes::index` hold raw
-    // pointers into the box interiors; unboxing would dangle them on `Vec` realloc.
+    // `Box` is load-bearing: `static_list` above holds raw pointers
+    // into the box interiors; unboxing would dangle them on `Vec` realloc.
     #[expect(clippy::vec_box)]
     all_routes: Vec<Box<Route>>,
 }
 
 impl<'a> RouteLoader<'a> {
+    fn new(extensions: &'a [Box<[u8]>], log: &'a mut bun_ast::Log, each_dir: EachDir<'a>) -> Self {
+        RouteLoader {
+            extensions,
+            log,
+            each_dir,
+            public_dir: Vec::new(),
+            path: Vec::new(),
+            dedupe_dynamic: StringHashMap::new(),
+            index: None,
+            static_list: StringHashMap::new(),
+            all_routes: Vec::new(),
+        }
+    }
+
     /// `extension_rank`: the place of the file's extension in `extensions`.
     fn append_route(&mut self, route: Route, extension_rank: usize) {
         // /index.js
@@ -426,7 +421,7 @@ impl<'a> RouteLoader<'a> {
         if route.param_count == 0 {
             if let Some(existing) = self.static_list.get(route.match_name()) {
                 // SAFETY: *existing aliases a Box<Route> in self.all_routes
-                Self::add_duplicate_error(self.log, &route, unsafe { &**existing });
+                Self::leave_out_duplicate(self.log, &route, unsafe { &**existing });
                 return;
             }
 
@@ -453,7 +448,7 @@ impl<'a> RouteLoader<'a> {
         }
 
         if let Some(&existing) = self.dedupe_dynamic.get(route.match_name()) {
-            Self::add_duplicate_error(self.log, &route, &self.all_routes[existing]);
+            Self::leave_out_duplicate(self.log, &route, &self.all_routes[existing]);
             return;
         }
         self.dedupe_dynamic
@@ -461,10 +456,8 @@ impl<'a> RouteLoader<'a> {
         self.all_routes.push(Box::new(route));
     }
 
-    /// `route` has the match name of `existing`, which the walk found first. Two names that
-    /// differ only in case are one route and no error: a file system that folds case has one
-    /// of the two files.
-    fn add_duplicate_error(log: &mut bun_ast::Log, route: &Route, existing: &Route) {
+    /// `route` is left out for `existing`. It is an error only if the names are the same in case too.
+    fn leave_out_duplicate(log: &mut bun_ast::Log, route: &Route, existing: &Route) {
         if route.name() != existing.name() {
             return;
         }
@@ -734,11 +727,7 @@ impl Route {
         let base = &base_[0..base_.len() - extname.len()];
         debug_assert!(!base.is_empty());
 
-        // this is a path like
-        // "/index.js"
-        // "/foo/index.ts"
-        // "/foo/bar.tsx"
-        // the name is this one without the extension and without a last "/index"
+        // `/foo/index.ts` has the name `/foo`, and `/foo/bar.tsx` has the name `/foo/bar`.
         let is_index_file = base == b"index";
         let name_len = if is_index_file {
             public_dir.len()
@@ -901,16 +890,14 @@ struct ListedName {
     is_link: bool,
 }
 
-/// The names in one directory, read from disk and in byte order: a file system has an order of
-/// its own. The resolver's listing is a cache, so a route scan cannot use it.
+/// The names in one directory, read from disk and put in byte order: a file system has an order of its own.
 struct DirListing {
     names: Vec<u8>,
     entries: Vec<ListedName>,
 }
 
 impl DirListing {
-    /// Closes `dir`: the walk has one directory open at a time. Leaves out a name that starts
-    /// with `.`, a link to nothing, and what is not a file or a directory. An error names `path`.
+    /// Closes `dir`, so that the walk has one directory open at a time. An error names `path`.
     fn read(dir: bun_sys::Dir, path: &[u8]) -> bun_sys::Result<DirListing> {
         let mut names: Vec<u8> = Vec::new();
         let mut entries: Vec<ListedName> = Vec::new();
@@ -949,8 +936,7 @@ impl DirListing {
         Ok(DirListing { names, entries })
     }
 
-    /// What `entry` is and whether it is a link, for a link or a name of no known kind. `None`
-    /// for what the walk leaves out. Opens nothing: an open of a FIFO does not return.
+    /// What a link or a name of no known kind is, and whether it is a link. `None`: the walk leaves it out.
     fn follow(
         dir: &bun_sys::Dir,
         entry: &bun_sys::dir_iterator::IteratorResult,
@@ -967,6 +953,7 @@ impl DirListing {
             return Ok(Some((kind, true)));
         }
 
+        // Asked with a stat and not an open: the open of a FIFO does not return.
         let mut buf = path_buffer_pool::get();
         let name = bun_paths::resolve_path::z(entry.name.slice_u8(), &mut buf);
         let mut kind = FileKind::SymLink;
@@ -1438,6 +1425,31 @@ pub(crate) use pattern::Pattern;
 mod tests {
     use super::*;
 
+    // `cargo test -p bun_router` links no highway kernel, so the two these tests reach are scalar stubs (Miri calls neither).
+
+    /// Returns `haystack_len` when `needle` does not occur, like the kernel.
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn highway_index_of_char(
+        haystack: *const u8,
+        haystack_len: usize,
+        needle: u8,
+    ) -> usize {
+        // SAFETY: test stub; callers pass a valid (ptr, len) pair.
+        let haystack = unsafe { core::slice::from_raw_parts(haystack, haystack_len) };
+        haystack
+            .iter()
+            .position(|&b| b == needle)
+            .unwrap_or(haystack_len)
+    }
+
+    /// `n` when `c` does not occur, like the kernel.
+    #[unsafe(no_mangle)]
+    unsafe extern "C" fn highway_last_index_of_char(h: *const u8, n: usize, c: u8) -> usize {
+        // SAFETY: test stub; callers pass a valid (ptr, len) pair.
+        let h = unsafe { core::slice::from_raw_parts(h, n) };
+        h.iter().rposition(|&b| b == c).unwrap_or(n)
+    }
+
     #[test]
     fn pattern_match() {
         type Entry = Param<'static>;
@@ -1652,12 +1664,131 @@ mod tests {
         assert!(run(optional_catch_all) == 0);
     }
 
-    // The route-loader integration tests ("Github
-    // API Route Loader", "Sample Route Loader", "Routes Basic", "Dynamic
-    // Routes") are not implemented: they assert through `ctx.matched_route`, which
-    // `Router::match_` does not yet populate (the JavaScriptHandler enqueue
-    // path is still commented out), and they consume fixture route lists that
-    // live in the test-runner harness crate.
+    /// The table a scan makes of `files` (directory below the routes directory, name) in the walk's order, and its errors.
+    fn table(files: &[(&[u8], &[u8])], extensions: &[&[u8]]) -> (Routes, Vec<Vec<u8>>) {
+        let extensions: Vec<Box<[u8]>> = extensions.iter().map(|e| Box::from(*e)).collect();
+        let mut log = bun_ast::Log::new();
+        let mut each_dir = |_: &[u8], _: &[u8]| {};
+        let mut loader = RouteLoader::new(&extensions, &mut log, &mut each_dir);
+        for (public_dir, base) in files {
+            let extname = bun_paths::extension(base);
+            let rank = extensions
+                .iter()
+                .position(|extension| &extname[1..] == extension.as_ref())
+                .unwrap();
+            let abs_path = [b"/pages", *public_dir, b"/", *base].concat();
+            if let Some(route) = Route::parse(base, extname, &abs_path, public_dir, loader.log) {
+                loader.append_route(route, rank);
+            }
+        }
+        let routes = loader.finish(Box::from(b"/pages/".as_slice()));
+        let errors = log.msgs.iter().map(|msg| msg.data.text.to_vec()).collect();
+        (routes, errors)
+    }
+
+    /// The name and file of the route that `path` matches, and the parameters.
+    fn match_of<'p>(
+        routes: &'p Routes,
+        path: &'p [u8],
+    ) -> Option<(&'p [u8], &'p [u8], Vec<(&'p [u8], &'p [u8])>)> {
+        let url_path = bun_http_types::URLPath::parse(path).unwrap();
+        let mut params = route_param::List::default();
+        let matched = routes.match_page_with_allocator(&url_path, &mut params)?;
+        let params = params
+            .iter()
+            .map(|param| (param.name, param.value))
+            .collect();
+        Some((matched.name, matched.file_path, params))
+    }
+
+    #[test]
+    fn route_table() {
+        let (routes, errors) = table(
+            &[
+                (b"", b"About.tsx"),
+                (b"", b"[ID].tsx"),
+                (b"", b"[id].tsx"),
+                (b"", b"a.ts"),
+                (b"", b"a.tsx"),
+                (b"", b"about.tsx"),
+                (b"", b"b.tsx"),
+                (b"/docs", b"[...rest].tsx"),
+                (b"", b"e.tsx"),
+                (b"", b"index.ts"),
+                (b"", b"index.tsx"),
+                (b"/opt", b"[[...all]].tsx"),
+                (b"/posts", b"[slug].tsx"),
+                (b"/posts", b"index.tsx"),
+                (b"/posts", b"new.tsx"),
+            ],
+            &[b"tsx", b"ts"],
+        );
+
+        // Two files of one name are an error. Two names that differ only in case are not.
+        assert_eq!(
+            errors,
+            [b"Route \"/a\" is already defined by /pages/a.ts".to_vec()]
+        );
+        let mut listed: Vec<(&[u8], &[u8])> = routes.iter().collect();
+        listed.sort_unstable();
+        assert_eq!(
+            listed,
+            [
+                (b"/".as_slice(), b"/pages/index.tsx".as_slice()),
+                (b"/About", b"/pages/About.tsx"),
+                (b"/[ID]", b"/pages/[ID].tsx"),
+                (b"/a", b"/pages/a.ts"),
+                (b"/b", b"/pages/b.tsx"),
+                (b"/docs/[...rest]", b"/pages/docs/[...rest].tsx"),
+                (b"/e", b"/pages/e.tsx"),
+                (b"/opt/[[...all]]", b"/pages/opt/[[...all]].tsx"),
+                (b"/posts", b"/pages/posts/index.tsx"),
+                (b"/posts/[slug]", b"/pages/posts/[slug].tsx"),
+                (b"/posts/new", b"/pages/posts/new.tsx"),
+            ]
+        );
+
+        let name_of = |path: &'static [u8]| match_of(&routes, path).map(|(name, _, _)| name);
+        assert_eq!(name_of(b"/"), Some(b"/".as_slice()));
+        assert_eq!(name_of(b"/a"), Some(b"/a".as_slice()));
+        assert_eq!(name_of(b"/About"), Some(b"/About".as_slice()));
+        assert_eq!(name_of(b"/about"), Some(b"/About".as_slice()));
+        assert_eq!(name_of(b"/posts"), Some(b"/posts".as_slice()));
+        assert_eq!(name_of(b"/posts/new"), Some(b"/posts/new".as_slice()));
+        assert_eq!(name_of(b"/none/of/them"), None);
+        assert_eq!(
+            match_of(&routes, b"/posts/hello?x=1"),
+            Some((
+                b"/posts/[slug]".as_slice(),
+                b"/pages/posts/[slug].tsx".as_slice(),
+                vec![(b"slug".as_slice(), b"hello".as_slice())]
+            ))
+        );
+        assert_eq!(
+            match_of(&routes, b"/42"),
+            Some((
+                b"/[ID]".as_slice(),
+                b"/pages/[ID].tsx".as_slice(),
+                vec![(b"ID".as_slice(), b"42".as_slice())]
+            ))
+        );
+        assert_eq!(
+            match_of(&routes, b"/docs/a/b"),
+            Some((
+                b"/docs/[...rest]".as_slice(),
+                b"/pages/docs/[...rest].tsx".as_slice(),
+                vec![(b"rest".as_slice(), b"a/b".as_slice())]
+            ))
+        );
+        assert_eq!(
+            match_of(&routes, b"/opt/x/y"),
+            Some((
+                b"/opt/[[...all]]".as_slice(),
+                b"/pages/opt/[[...all]].tsx".as_slice(),
+                vec![(b"all".as_slice(), b"x/y".as_slice())]
+            ))
+        );
+    }
 
     #[test]
     fn pattern() {

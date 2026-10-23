@@ -14,7 +14,7 @@ use bun_ptr::BackRef;
 
 use bun_http_types::URLPath;
 use bun_resolver::fs as Fs;
-use bun_router::{RouteConfig, Routes};
+use bun_router::{EachDir, RouteConfig, Routes};
 use bun_sys_jsc::ErrorJsc as _;
 use bun_url::{CombinedScanner, QueryStringMap, URL, route_param};
 
@@ -65,13 +65,12 @@ pub(crate) struct FileSystemRouter {
     routes: JsCell<Rc<Routes>>,
 }
 
-/// The routes that are below `config.dir` on disk now, or `None` if there is no such directory.
-/// `log` gets a message for each route file that is left out. `each_dir` is `Routes::scan`'s.
+/// The routes below `config.dir` on disk now, or `None` if there is no such directory.
 fn scan(
     global: &JSGlobalObject,
     config: &RouteConfig,
     log: &mut Log::Log,
-    each_dir: &mut dyn FnMut(&[u8], &[u8]),
+    each_dir: EachDir<'_>,
 ) -> JsResult<Option<Routes>> {
     let dir = strings::paths::without_trailing_slash_windows_path(&config.dir);
     match Routes::scan(dir, &config.extensions, log, each_dir) {
@@ -263,9 +262,7 @@ impl FileSystemRouter {
     ) -> bindgen::Result<'a, JsWrapper<'a, Self>> {
         let global = cx.global();
         let vm = global.bun_vm();
-        // The resolver forgets what it knows of `dir` and of each directory the scan reads, under
-        // the name that `dir` gives it and under its real path. A module in them is then resolved
-        // from the disk, as the routes are.
+        // The resolver reads again, under both names, what the scan reads: a module there then resolves as the routes do.
         let forget = |path: &[u8]| {
             let _ = vm.as_mut().transpiler.resolver.bust_dir_cache(path);
         };
