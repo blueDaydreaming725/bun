@@ -9,7 +9,7 @@ use bun_jsc::bindgen::{self, JsHeap, JsLocal, JsPayload as _, JsScope, JsWrapper
 use bun_jsc::ref_string::{RefString, StringTooLong};
 use bun_jsc::virtual_machine::VirtualMachine;
 use bun_jsc::{JSGlobalObject, JSValue, JsCell, JsResult, LogJsc};
-use bun_paths::{self as path, MAX_PATH_BYTES};
+use bun_paths::{self as path, MAX_PATH_BYTES, SEP};
 use bun_ptr::BackRef;
 
 use bun_http_types::URLPath;
@@ -66,22 +66,16 @@ pub(crate) struct FileSystemRouter {
 }
 
 /// The routes that are below `config.dir` on disk now, or `None` if there is no such directory.
-/// `log` gets a message for each route file that is left out.
+/// `log` gets a message for each route file that is left out. `each_dir` is `Routes::scan`'s.
 fn scan(
     global: &JSGlobalObject,
     config: &RouteConfig,
     log: &mut Log::Log,
+    each_dir: &mut dyn FnMut(&[u8], &[u8]),
 ) -> JsResult<Option<Routes>> {
     let dir = strings::paths::without_trailing_slash_windows_path(&config.dir);
-    let scanned = match bun_sys::Dir::open(dir) {
-        Ok(dir) => Routes::scan(dir, &config.extensions, log),
-        Err(err) if matches!(err.get_errno(), bun_sys::E::ENOENT | bun_sys::E::ENOTDIR) => {
-            return Ok(None);
-        }
-        Err(err) => Err(err),
-    };
-    match scanned {
-        Ok(routes) => Ok(Some(routes)),
+    match Routes::scan(dir, &config.extensions, log, each_dir) {
+        Ok(routes) => Ok(routes),
         Err(err) => Err(global.throw_value(err.to_js(global)?)),
     }
 }
@@ -143,7 +137,7 @@ impl FileSystemRouter {
             extensions: extensions.into(),
         };
         let mut log = Log::Log::new();
-        let Some(routes) = scan(global, &config, &mut log)? else {
+        let Some(routes) = scan(global, &config, &mut log, &mut |_, _| {})? else {
             return Err(cx.heap.error(format_args!(
                 "Unable to find directory: {}",
                 bstr::BStr::new(root_dir_path)
@@ -267,9 +261,38 @@ impl FileSystemRouter {
         this_value: JsWrapper<'a, Self>,
         cx: &mut JsScope<'a>,
     ) -> bindgen::Result<'a, JsWrapper<'a, Self>> {
+        let global = cx.global();
+        let vm = global.bun_vm();
+        // The resolver forgets what it knows of `dir` and of each directory the scan reads, under
+        // the name that `dir` gives it and under its real path. A module in them is then resolved
+        // from the disk, as the routes are.
+        let forget = |path: &[u8]| {
+            let _ = vm.as_mut().transpiler.resolver.bust_dir_cache(path);
+        };
+        let dir = strings::paths::without_trailing_slash_windows_path(&self.config.dir);
+        forget(dir);
+        let mut named: Vec<u8> = Vec::new();
+        let mut each_dir = |public_dir: &[u8], real_path: &[u8]| {
+            named.clear();
+            named.extend_from_slice(dir);
+            if let Some(below) = public_dir.strip_prefix(b"/") {
+                // `dir` ends with a separator only when it is the root of a file system.
+                if !dir.ends_with(&[SEP]) {
+                    named.push(SEP);
+                }
+                let start = named.len();
+                named.extend_from_slice(below);
+                path::resolve_path::posix_to_platform_in_place(&mut named[start..]);
+                forget(&named);
+            }
+            if real_path != named.as_slice() {
+                forget(real_path);
+            }
+        };
+
         // The messages are not read: a route file that has an error is left out.
         let mut log = Log::Log::new();
-        let Some(routes) = scan(cx.global(), &self.config, &mut log)? else {
+        let Some(routes) = scan(global, &self.config, &mut log, &mut each_dir)? else {
             return Err(cx.heap.error(format_args!(
                 "Unable to find directory: {}",
                 bstr::BStr::new(&*self.config.dir)

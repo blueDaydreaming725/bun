@@ -8,19 +8,13 @@
 use core::cmp::Ordering;
 use core::ptr::NonNull;
 
-use bun_collections::{ArrayHashMap, StringHashMap};
+use bun_collections::StringHashMap;
 use bun_core::{ZStr, strings};
 use bun_paths::{MAX_PATH_BYTES, SEP, path_buffer_pool};
 use bun_ptr::RawSlice;
-use bun_sys::FileKind;
+use bun_sys::{E, FileKind};
 
 use bun_http_types::URLPath::URLPath;
-
-// Wyhash with seed 0. NOT Wyhash11 (different algo).
-#[inline]
-fn wyhash(input: &[u8]) -> u64 {
-    bun_wyhash::hash(input)
-}
 
 use bun_collections::index_sort;
 use bun_core::HashedString;
@@ -42,11 +36,6 @@ pub struct RouteConfig {
     // maybe like CBOR
     pub extensions: Box<[Box<[u8]>]>,
 }
-
-// `hash_const` is byte-identical to the runtime `bun_wyhash::hash` (seed 0);
-// `tests::hash_const_matches_runtime` in `bun_wyhash` guards drift.
-const INDEX_ROUTE_HASH: u32 =
-    bun_wyhash::hash_const(0, b"$$/index-route$$-!(@*@#&*%-901823098123") as u32;
 
 // Param/List are lifetime-parameterized: `name` borrows the route name
 // (owned by `Routes`) and `value` borrows the *request URL buffer*, so the
@@ -149,16 +138,36 @@ pub struct Routes {
 }
 
 impl Routes {
-    /// Reads the tree below `dir` from disk, never from a cache. Leaves out a directory it cannot read.
+    /// Reads `dir` and the tree below it from disk, never from a cache. `Ok(None)`: there is no
+    /// directory at `dir`.
+    ///
+    /// The walk leaves out a name that is gone or that may not be read. Every other error ends
+    /// the scan: the routes without that name would not be the tree on disk. `log` gets an error
+    /// for each route file that is left out because of its name.
+    ///
+    /// `each_dir` gets each directory that is read: its path below `dir`, which is empty or like
+    /// `/blog/[slug]`, and its real path.
     pub fn scan(
-        dir: bun_sys::Dir,
+        dir: &[u8],
         extensions: &[Box<[u8]>],
         log: &mut bun_ast::Log,
-    ) -> bun_sys::Result<Routes> {
-        let real_path: Vec<u8> = dir.get_fd_path(&mut path_buffer_pool::get())?.to_vec();
-        let listing = DirListing::read(dir)?;
+        each_dir: &mut dyn FnMut(&[u8], &[u8]),
+    ) -> bun_sys::Result<Option<Routes>> {
+        let root = match WalkedDir::root(dir) {
+            Ok(root) => root,
+            Err(err)
+                if matches!(
+                    err.get_errno(),
+                    E::ENOENT | E::ENOTDIR | E::ELOOP | E::ENAMETOOLONG
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(err) => return Err(err.with_path(dir)),
+        };
+        each_dir(b"", &root.real_path);
 
-        let mut routes_dir = real_path.clone();
+        let mut routes_dir = root.real_path.clone();
         bun_paths::resolve_path::platform_to_posix_in_place(&mut routes_dir[..]);
         if routes_dir.last() != Some(&b'/') {
             routes_dir.push(b'/');
@@ -167,20 +176,16 @@ impl Routes {
         let mut loader = RouteLoader {
             extensions,
             log,
+            each_dir,
             public_dir: Vec::new(),
             path: Vec::new(),
-            dedupe_dynamic: ArrayHashMap::new(),
+            dedupe_dynamic: StringHashMap::new(),
             index: None,
             static_list: StringHashMap::new(),
             all_routes: Vec::new(),
         };
-        loader.load(WalkedDir {
-            listing,
-            next: 0,
-            real_path,
-            public_dir_len: 0,
-        });
-        Ok(loader.finish(routes_dir.into_boxed_slice()))
+        loader.load(root)?;
+        Ok(Some(loader.finish(routes_dir.into_boxed_slice())))
     }
 
     #[inline]
@@ -322,65 +327,106 @@ struct WalkedDir {
     public_dir_len: usize,
 }
 
+impl WalkedDir {
+    fn root(dir: &[u8]) -> bun_sys::Result<WalkedDir> {
+        let root = bun_sys::Dir::open(dir)?;
+        // Without a name from the system for what is open, the caller's name stands.
+        let real_path = match root.get_fd_path(&mut path_buffer_pool::get()) {
+            Ok(real_path) => real_path.to_vec(),
+            Err(_) => dir.to_vec(),
+        };
+        Ok(WalkedDir {
+            listing: DirListing::read(root, dir)?,
+            next: 0,
+            real_path,
+            public_dir_len: 0,
+        })
+    }
+}
+
+/// `None` for an error that says a name is gone or may not be read: the walk leaves such a name
+/// out. Every other error ends the scan, and names `path`.
+fn unless_skippable<T>(result: bun_sys::Result<T>, path: &[u8]) -> bun_sys::Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(err)
+            if matches!(
+                err.get_errno(),
+                E::ENOENT
+                    | E::ENOTDIR
+                    | E::ELOOP
+                    | E::ENAMETOOLONG
+                    | E::EACCES
+                    | E::EPERM
+                    | E::EBUSY
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(err) => Err(err.with_path(path)),
+    }
+}
+
+/// Where the link at `path` leads.
+fn link_target<'b>(path: &ZStr, buf: &'b mut bun_paths::PathBuffer) -> bun_sys::Result<&'b [u8]> {
+    // One `readlink`, of the descriptor. `realpath` does one for each directory of `path`.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let link = bun_sys::File::open(path, bun_sys::O::PATH | bun_sys::O::CLOEXEC, 0)?;
+        bun_sys::get_fd_path(link.handle(), buf).map(|target| &*target)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        bun_sys::realpath(path, buf)
+    }
+}
+
 struct RouteLoader<'a> {
     extensions: &'a [Box<[u8]>],
     log: &'a mut bun_ast::Log,
+    each_dir: &'a mut dyn FnMut(&[u8], &[u8]),
 
     /// The directory being read, below the routes directory: empty, or `/blog/[slug]`.
     public_dir: Vec<u8>,
     /// The path of the route file being read.
     path: Vec<u8>,
 
-    /// Hash of a dynamic route to its index in `all_routes`.
-    dedupe_dynamic: ArrayHashMap<u32, usize>,
-    // NOTE: raw NonNull (not &'a Route) because it points into self.all_routes
-    // (self-referential); `Routes` co-owns it with `list`.
-    index: Option<NonNull<Route>>,
+    /// Match name of a dynamic route to its place in `all_routes`.
+    dedupe_dynamic: StringHashMap<usize>,
+    /// The place of the index route in `all_routes`, and of its file's extension in `extensions`.
+    index: Option<(usize, usize)>,
     static_list: StringHashMap<*const Route>,
-    // `Box` is load-bearing: `index` / `static_list` above hold raw pointers
-    // into the box interiors; unboxing would dangle them on `Vec` realloc.
+    // `Box` is load-bearing: `static_list` above and `Routes::index` hold raw
+    // pointers into the box interiors; unboxing would dangle them on `Vec` realloc.
     #[expect(clippy::vec_box)]
     all_routes: Vec<Box<Route>>,
 }
 
 impl<'a> RouteLoader<'a> {
-    fn append_route(&mut self, route: Route) {
-        use bun_collections::hash_map::Entry;
-
+    /// `extension_rank`: the place of the file's extension in `extensions`.
+    fn append_route(&mut self, route: Route, extension_rank: usize) {
         // /index.js
-        if route.full_hash == INDEX_ROUTE_HASH {
-            // Of several index files, the first in byte order is the index route.
-            if self.index.is_some() {
-                return;
+        if route.is_index() {
+            match self.index {
+                // Of several index files, the one whose extension is first in `extensions`.
+                Some((at, rank)) if extension_rank < rank => {
+                    *self.all_routes[at] = route;
+                    self.index = Some((at, extension_rank));
+                }
+                Some(_) => {}
+                None => {
+                    self.index = Some((self.all_routes.len(), extension_rank));
+                    self.all_routes.push(Box::new(route));
+                }
             }
-            // Derived from a `&mut`, not a `&*` downgrade: `NonNull::from(&T)`
-            // yields a frozen tag. Today `index` is only read through (`match_`
-            // takes `as_ref()`), so the old spelling was not live UB, but it was
-            // one write away from it. The static arm below needs no such change:
-            // `&raw const *box` forms no reference at all. Parking the `Box`
-            // before deriving is belt-and-braces.
-            self.all_routes.push(Box::new(route));
-            let parked = self.all_routes.last_mut().expect("just pushed");
-            // Box contents have a stable address; never removed from
-            // `all_routes` until consumed by `finish`.
-            self.index = Some(NonNull::from(&mut **parked));
             return;
         }
 
         // static route
         if route.param_count == 0 {
             if let Some(existing) = self.static_list.get(route.match_name()) {
-                let source = bun_ast::Source::init_empty_file(route.abs_path());
-                self.log.add_error_fmt(
-                    Some(&source),
-                    bun_ast::Loc::EMPTY,
-                    format_args!(
-                        "Route \"{}\" is already defined by {}",
-                        bstr::BStr::new(route.name()),
-                        // SAFETY: *existing aliases a Box<Route> in self.all_routes
-                        bstr::BStr::new(unsafe { &**existing }.abs_path()),
-                    ),
-                );
+                // SAFETY: *existing aliases a Box<Route> in self.all_routes
+                Self::add_duplicate_error(self.log, &route, unsafe { &**existing });
                 return;
             }
 
@@ -395,22 +441,6 @@ impl<'a> RouteLoader<'a> {
             // This hack is below the engineering quality bar I'm happy with.
             // It will cause unexpected behavior.
             if new_route.has_uppercase {
-                if let Some(existing) = self.static_list.get(&new_route.name()[1..]) {
-                    let source = bun_ast::Source::init_empty_file(new_route.abs_path());
-                    self.log.add_error_fmt(
-                        Some(&source),
-                        bun_ast::Loc::EMPTY,
-                        format_args!(
-                            "Route \"{}\" is already defined by {}",
-                            bstr::BStr::new(new_route.name()),
-                            // SAFETY: *existing aliases a Box<Route> in self.all_routes
-                            bstr::BStr::new(unsafe { &**existing }.abs_path()),
-                        ),
-                    );
-
-                    return;
-                }
-
                 self.static_list
                     .put_assume_capacity(&new_route.name()[1..], new_route_ptr);
             }
@@ -422,34 +452,39 @@ impl<'a> RouteLoader<'a> {
             return;
         }
 
-        {
-            match self.dedupe_dynamic.entry(route.full_hash) {
-                Entry::Occupied(e) => {
-                    let source = bun_ast::Source::init_empty_file(route.abs_path());
-                    self.log.add_error_fmt(
-                        Some(&source),
-                        bun_ast::Loc::EMPTY,
-                        format_args!(
-                            "Route \"{}\" is already defined by {}",
-                            bstr::BStr::new(route.name()),
-                            bstr::BStr::new(self.all_routes[*e.get()].abs_path()),
-                        ),
-                    );
-                    return;
-                }
-                Entry::Vacant(v) => {
-                    v.insert(self.all_routes.len());
-                }
-            }
+        if let Some(&existing) = self.dedupe_dynamic.get(route.match_name()) {
+            Self::add_duplicate_error(self.log, &route, &self.all_routes[existing]);
+            return;
         }
+        self.dedupe_dynamic
+            .put_assume_capacity(route.match_name(), self.all_routes.len());
+        self.all_routes.push(Box::new(route));
+    }
 
-        {
-            let new_route = Box::new(route);
-            self.all_routes.push(new_route);
+    /// `route` has the match name of `existing`, which the walk found first. Two names that
+    /// differ only in case are one route and no error: a file system that folds case has one
+    /// of the two files.
+    fn add_duplicate_error(log: &mut bun_ast::Log, route: &Route, existing: &Route) {
+        if route.name() != existing.name() {
+            return;
         }
+        let source = bun_ast::Source::init_empty_file(route.abs_path());
+        log.add_error_fmt(
+            Some(&source),
+            bun_ast::Loc::EMPTY,
+            format_args!(
+                "Route \"{}\" is already defined by {}",
+                bstr::BStr::new(route.name()),
+                bstr::BStr::new(existing.abs_path()),
+            ),
+        );
     }
 
     fn finish(mut self, dir: Box<[u8]>) -> Routes {
+        // The sort moves the boxes, and not what is in them.
+        let index = self
+            .index
+            .map(|(at, _)| NonNull::from(&mut *self.all_routes[at]));
         index_sort::sort_slice_unstable_by(&mut self.all_routes, |a, b| {
             sorter::sort_by_name_cmp(a, b)
         });
@@ -464,7 +499,7 @@ impl<'a> RouteLoader<'a> {
                 dynamic_start = Some(i);
             }
 
-            if route.full_hash == INDEX_ROUTE_HASH {
+            if route.is_index() {
                 index_id = Some(i);
             }
 
@@ -490,13 +525,13 @@ impl<'a> RouteLoader<'a> {
             static_: self.static_list,
             // Points into a Box<Route> now owned by `route_list`; co-owned raw
             // pointer.
-            index: self.index,
+            index,
             dir,
         }
     }
 
     /// Loads the routes of `root` and of the directories below it, depth first.
-    fn load(&mut self, root: WalkedDir) {
+    fn load(&mut self, root: WalkedDir) -> bun_sys::Result<()> {
         // Not the call stack: the tree on disk decides how deep this goes.
         let mut walked = vec![root];
         while let Some(top) = walked.len().checked_sub(1) {
@@ -519,12 +554,15 @@ impl<'a> RouteLoader<'a> {
 
                     let mut real_path = Vec::new();
                     join_path(&mut real_path, &walked[top].real_path, entry.name);
-                    let Ok(child) = bun_sys::Dir::open(&real_path) else {
+                    let Some(child) = unless_skippable(bun_sys::Dir::open(&real_path), &real_path)?
+                    else {
                         continue;
                     };
                     if entry.is_link {
                         let mut buf = path_buffer_pool::get();
-                        let Ok(target) = child.get_fd_path(&mut buf) else {
+                        let Some(target) =
+                            unless_skippable(child.get_fd_path(&mut buf), &real_path)?
+                        else {
                             continue;
                         };
                         // A link to a directory the walk is inside of would never end.
@@ -534,12 +572,15 @@ impl<'a> RouteLoader<'a> {
                         real_path.clear();
                         real_path.extend_from_slice(target);
                     }
-                    let Ok(listing) = DirListing::read(child) else {
+                    let Some(listing) =
+                        unless_skippable(DirListing::read(child, &real_path), &real_path)?
+                    else {
                         continue;
                     };
 
                     self.public_dir.push(b'/');
                     self.public_dir.extend_from_slice(entry.name);
+                    (self.each_dir)(&self.public_dir, &real_path);
                     walked.push(WalkedDir {
                         listing,
                         next: 0,
@@ -554,13 +595,13 @@ impl<'a> RouteLoader<'a> {
                     if extname.len() < 2 {
                         continue;
                     }
-                    if !self
+                    let Some(extension_rank) = self
                         .extensions
                         .iter()
-                        .any(|extension| &extname[1..] == extension.as_ref())
-                    {
+                        .position(|extension| &extname[1..] == extension.as_ref())
+                    else {
                         continue;
-                    }
+                    };
 
                     join_path(&mut self.path, &walked[top].real_path, entry.name);
                     if self.path.len() >= MAX_PATH_BYTES {
@@ -580,11 +621,11 @@ impl<'a> RouteLoader<'a> {
                     // Only a link needs the file system to say where it leads.
                     if entry.is_link {
                         self.path.push(0);
+                        let link = ZStr::from_buf(&self.path, self.path.len() - 1);
                         let mut buf = path_buffer_pool::get();
-                        let Ok(target) = bun_sys::realpath(
-                            ZStr::from_buf(&self.path, self.path.len() - 1),
-                            &mut buf,
-                        ) else {
+                        let Some(target) =
+                            unless_skippable(link_target(link, &mut buf), link.as_bytes())?
+                        else {
                             continue;
                         };
                         self.path.clear();
@@ -594,11 +635,12 @@ impl<'a> RouteLoader<'a> {
                     if let Some(route) =
                         Route::parse(entry.name, extname, &self.path, &self.public_dir, self.log)
                     {
-                        self.append_route(route);
+                        self.append_route(route, extension_rank);
                     }
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -643,7 +685,6 @@ pub struct Route {
     match_name_end: u32,
     abs_path_start: u32,
 
-    pub(crate) full_hash: u32,
     pub(crate) param_count: u16,
 
     pub(crate) kind: pattern::Tag,
@@ -674,6 +715,12 @@ impl Route {
     #[inline]
     pub(crate) fn abs_path(&self) -> &[u8] {
         &self.strings[self.abs_path_start as usize..]
+    }
+
+    /// Whether this is the route of an index file in the routes directory, which is `/`.
+    #[inline]
+    fn is_index(&self) -> bool {
+        self.name_len == 1
     }
 
     /// `public_dir`: the directory of the file below the routes directory, empty or `/blog/[slug]`.
@@ -735,18 +782,12 @@ impl Route {
         strings.extend_from_slice(abs_path);
         bun_paths::resolve_path::platform_to_posix_in_place(&mut strings[abs_path_start..]);
 
-        let full_hash = if is_index {
-            INDEX_ROUTE_HASH
-        } else {
-            wyhash(&strings[..name_len]) as u32
-        };
         Some(Route {
             strings: strings.into_boxed_slice(),
             name_len: name_len as u32,
             match_name_start: match_name.start as u32,
             match_name_end: match_name.end as u32,
             abs_path_start: abs_path_start as u32,
-            full_hash,
             param_count: validation_result.param_count,
             kind: validation_result.kind,
             has_uppercase,
@@ -869,12 +910,12 @@ struct DirListing {
 
 impl DirListing {
     /// Closes `dir`: the walk has one directory open at a time. Leaves out a name that starts
-    /// with `.`, a link to nothing, and what is not a file or a directory.
-    fn read(dir: bun_sys::Dir) -> bun_sys::Result<DirListing> {
+    /// with `.`, a link to nothing, and what is not a file or a directory. An error names `path`.
+    fn read(dir: bun_sys::Dir, path: &[u8]) -> bun_sys::Result<DirListing> {
         let mut names: Vec<u8> = Vec::new();
         let mut entries: Vec<ListedName> = Vec::new();
         let mut iterator = bun_sys::iterate_dir(dir.fd());
-        while let Some(entry) = iterator.next()? {
+        while let Some(entry) = iterator.next().map_err(|err| err.with_path(path))? {
             let name = entry.name.slice_u8();
             if name.first() == Some(&b'.') {
                 continue;
@@ -884,7 +925,7 @@ impl DirListing {
                 FileKind::Directory => (EntryKind::Dir, false),
                 // `Unknown`: the file system does not say what the name is.
                 FileKind::SymLink | FileKind::Unknown => {
-                    let Some(followed) = Self::follow(&dir, &entry) else {
+                    let Some(followed) = Self::follow(&dir, &entry, path)? else {
                         continue;
                     };
                     followed
@@ -908,12 +949,13 @@ impl DirListing {
         Ok(DirListing { names, entries })
     }
 
-    /// What `entry` is and whether it is a link, for a link or a name of no known kind. Opens
-    /// nothing: a FIFO would block.
+    /// What `entry` is and whether it is a link, for a link or a name of no known kind. `None`
+    /// for what the walk leaves out. Opens nothing: an open of a FIFO does not return.
     fn follow(
         dir: &bun_sys::Dir,
         entry: &bun_sys::dir_iterator::IteratorResult,
-    ) -> Option<(EntryKind, bool)> {
+        dir_path: &[u8],
+    ) -> bun_sys::Result<Option<(EntryKind, bool)>> {
         let mut is_link = entry.kind == FileKind::SymLink;
         // On Windows a link says what it stands for.
         if is_link && let Some(is_dir) = entry.link_is_directory() {
@@ -922,26 +964,30 @@ impl DirListing {
             } else {
                 EntryKind::File
             };
-            return Some((kind, true));
+            return Ok(Some((kind, true)));
         }
 
         let mut buf = path_buffer_pool::get();
         let name = bun_paths::resolve_path::z(entry.name.slice_u8(), &mut buf);
         let mut kind = FileKind::SymLink;
         if !is_link {
-            let stat = bun_sys::lstatat(dir.fd(), name).ok()?;
+            let Some(stat) = unless_skippable(bun_sys::lstatat(dir.fd(), name), dir_path)? else {
+                return Ok(None);
+            };
             kind = bun_sys::kind_from_mode(stat.st_mode as bun_sys::Mode);
             is_link = kind == FileKind::SymLink;
         }
         if is_link {
-            let stat = bun_sys::fstatat(dir.fd(), name).ok()?;
+            let Some(stat) = unless_skippable(bun_sys::fstatat(dir.fd(), name), dir_path)? else {
+                return Ok(None);
+            };
             kind = bun_sys::kind_from_mode(stat.st_mode as bun_sys::Mode);
         }
-        match kind {
+        Ok(match kind {
             FileKind::File => Some((EntryKind::File, is_link)),
             FileKind::Directory => Some((EntryKind::Dir, is_link)),
             _ => None,
-        }
+        })
     }
 
     fn get(&self, index: usize) -> Option<DirListingEntry<'_>> {
